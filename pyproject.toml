@@ -17,6 +17,7 @@ dependencies = [
     "beautifulsoup4>=4.9.3",
     "pyshadow<=0.0.5",
     "google-workspace>=0.20.3",
+    "simple-salesforce>=1.12.6"
 ]
 
 author = [{ name = "Block", email = "ai-oss-tools@block.xyz" }]
