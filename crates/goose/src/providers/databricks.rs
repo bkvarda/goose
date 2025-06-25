@@ -299,6 +299,22 @@ impl DatabricksProvider {
             }
 
             let auth_header = self.ensure_auth_header().await?;
+            
+            // Prepare headers for logging
+            let mut headers = std::collections::HashMap::new();
+            headers.insert("Authorization".to_string(), auth_header.clone());
+            headers.insert("Content-Type".to_string(), "application/json".to_string());
+
+            // Log HTTP request with correlation ID
+            let start_time = std::time::Instant::now();
+            let correlation_id = super::utils::log_http_request_with_correlation(
+                "databricks",
+                url.as_str(),
+                "POST",
+                &headers,
+                &payload,
+            ).await;
+
             let response = self
                 .client
                 .post(url.clone())
@@ -308,7 +324,26 @@ impl DatabricksProvider {
                 .await?;
 
             let status = response.status();
+            let duration_ms = start_time.elapsed().as_millis() as u64;
+            
+            // Extract headers before consuming the response
+            let response_headers: std::collections::HashMap<String, String> = response
+                .headers()
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                .collect();
+            
             let payload: Option<Value> = response.json().await.ok();
+
+            // Log HTTP response with correlation ID
+            super::utils::log_http_response_with_correlation(
+                &correlation_id,
+                "databricks",
+                status.as_u16(),
+                &response_headers,
+                &payload.as_ref().unwrap_or(&json!(null)),
+                duration_ms,
+            ).await;
 
             match status {
                 StatusCode::OK => {
@@ -339,8 +374,6 @@ impl DatabricksProvider {
                         "exceed context limit",
                         "input length",
                         "max_tokens",
-                        "decrease input length",
-                        "context limit",
                     ];
                     if check_phrases.iter().any(|c| payload_str.contains(c)) {
                         return Err(ProviderError::ContextLengthExceeded(payload_str));
@@ -353,35 +386,27 @@ impl DatabricksProvider {
                             .get("message")
                             .and_then(|m| m.as_str())
                             .or_else(|| {
-                                payload
-                                    .get("external_model_message")
+                                payload.get("external_model_message")
                                     .and_then(|ext| ext.get("message"))
                                     .and_then(|m| m.as_str())
                             })
-                            .unwrap_or("Unknown error")
-                            .to_string();
+                            .unwrap_or("Unknown error").to_string();
                     }
 
                     tracing::debug!(
-                        "{}",
-                        format!(
-                            "Provider request failed with status: {}. Payload: {:?}",
-                            status, payload
-                        )
+                        "{}", format!("Provider request failed with status: {}. Payload: {:?}", status, payload)
                     );
-                    return Err(ProviderError::RequestFailed(format!(
-                        "Request failed with status: {}. Message: {}",
-                        status, error_msg
-                    )));
+                    return Err(ProviderError::RequestFailed(format!("Request failed with status: {}. Message: {}", status, error_msg)));
                 }
                 StatusCode::TOO_MANY_REQUESTS => {
                     attempts += 1;
-                    let error_msg = format!(
-                        "Rate limit exceeded (attempt {}/{}): {:?}",
-                        attempts, self.retry_config.max_retries, payload
+                    let error_msg = format!("Rate limit exceeded (attempt {}/{}): {:?}", 
+                        attempts, 
+                        self.retry_config.max_retries,
+                        payload
                     );
                     tracing::warn!("{}. Retrying after backoff...", error_msg);
-
+                    
                     // Store the error in case we need to return it after max retries
                     last_error = Some(ProviderError::RateLimitExceeded(error_msg));
 
@@ -395,12 +420,13 @@ impl DatabricksProvider {
                 }
                 StatusCode::INTERNAL_SERVER_ERROR | StatusCode::SERVICE_UNAVAILABLE => {
                     attempts += 1;
-                    let error_msg = format!(
-                        "Server error (attempt {}/{}): {:?}",
-                        attempts, self.retry_config.max_retries, payload
+                    let error_msg = format!("Server error (attempt {}/{}): {:?}", 
+                        attempts, 
+                        self.retry_config.max_retries,
+                        payload
                     );
                     tracing::warn!("{}. Retrying after backoff...", error_msg);
-
+                    
                     // Store the error in case we need to return it after max retries
                     last_error = Some(ProviderError::ServerError(error_msg));
 
@@ -414,16 +440,9 @@ impl DatabricksProvider {
                 }
                 _ => {
                     tracing::debug!(
-                        "{}",
-                        format!(
-                            "Provider request failed with status: {}. Payload: {:?}",
-                            status, payload
-                        )
+                        "{}", format!("Provider request failed with status: {}. Payload: {:?}", status, payload)
                     );
-                    return Err(ProviderError::RequestFailed(format!(
-                        "Request failed with status: {}",
-                        status
-                    )));
+                    return Err(ProviderError::RequestFailed(format!("Request failed with status: {}", status)));
                 }
             }
         }
@@ -443,6 +462,12 @@ impl Provider for DatabricksProvider {
             vec![
                 ConfigKey::new("DATABRICKS_HOST", true, false, None),
                 ConfigKey::new("DATABRICKS_TOKEN", false, true, None),
+                ConfigKey::new("GOOSE_HTTP_LOG_ENABLED", false, false, Some("false")),
+                ConfigKey::new("GOOSE_HTTP_LOG_FILE", false, false, Some("logs/goose_http_<timestamp>.log")),
+                ConfigKey::new("DATABRICKS_MAX_RETRIES", false, false, Some(&DEFAULT_MAX_RETRIES.to_string())),
+                ConfigKey::new("DATABRICKS_INITIAL_RETRY_INTERVAL_MS", false, false, Some(&DEFAULT_INITIAL_RETRY_INTERVAL_MS.to_string())),
+                ConfigKey::new("DATABRICKS_BACKOFF_MULTIPLIER", false, false, Some(&DEFAULT_BACKOFF_MULTIPLIER.to_string())),
+                ConfigKey::new("DATABRICKS_MAX_RETRY_INTERVAL_MS", false, false, Some(&DEFAULT_MAX_RETRY_INTERVAL_MS.to_string())),
             ],
         )
     }

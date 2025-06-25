@@ -8,7 +8,7 @@ use std::time::Duration;
 use super::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage};
 use super::errors::ProviderError;
 use super::formats::anthropic::{create_request, get_usage, response_to_message};
-use super::utils::{emit_debug_trace, get_model};
+use super::utils::{emit_debug_trace, get_model, log_http_request_with_correlation, log_http_response_with_correlation};
 use crate::message::Message;
 use crate::model::ModelConfig;
 use mcp_core::tool::Tool;
@@ -68,6 +68,25 @@ impl AnthropicProvider {
             ProviderError::RequestFailed(format!("Failed to construct endpoint URL: {e}"))
         })?;
 
+        // Convert HeaderMap to HashMap for logging
+        let mut headers_map = std::collections::HashMap::new();
+        for (key, value) in headers.iter() {
+            let key_str = key.as_str();
+            if let Ok(value_str) = value.to_str() {
+                headers_map.insert(key_str.to_string(), value_str.to_string());
+            }
+        }
+
+        // Log HTTP request with correlation ID
+        let start_time = std::time::Instant::now();
+        let correlation_id = log_http_request_with_correlation(
+            "anthropic",
+            url.as_str(),
+            "POST",
+            &headers_map,
+            &payload,
+        ).await;
+
         let response = self
             .client
             .post(url)
@@ -77,7 +96,26 @@ impl AnthropicProvider {
             .await?;
 
         let status = response.status();
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+        
+        // Extract response headers before consuming the response
+        let response_headers: std::collections::HashMap<String, String> = response
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        
         let payload: Option<Value> = response.json().await.ok();
+
+        // Log HTTP response with correlation ID
+        log_http_response_with_correlation(
+            &correlation_id,
+            "anthropic",
+            status.as_u16(),
+            &response_headers,
+            &payload.as_ref().unwrap_or(&serde_json::json!(null)),
+            duration_ms,
+        ).await;
 
         // https://docs.anthropic.com/en/api/errors
         match status {
@@ -188,6 +226,22 @@ impl Provider for AnthropicProvider {
     /// Fetch supported models from Anthropic; returns Err on failure, Ok(None) if not present
     async fn fetch_supported_models_async(&self) -> Result<Option<Vec<String>>, ProviderError> {
         let url = format!("{}/v1/models", self.host);
+        
+        // Prepare headers for logging
+        let mut headers_map = std::collections::HashMap::new();
+        headers_map.insert("anthropic-version".to_string(), ANTHROPIC_API_VERSION.to_string());
+        headers_map.insert("x-api-key".to_string(), "***REDACTED***".to_string()); // API key will be redacted by sanitization
+        
+        // Log HTTP request with correlation ID
+        let start_time = std::time::Instant::now();
+        let correlation_id = log_http_request_with_correlation(
+            "anthropic",
+            &url,
+            "GET",
+            &headers_map,
+            &serde_json::json!({}),
+        ).await;
+
         let response = self
             .client
             .get(&url)
@@ -195,7 +249,29 @@ impl Provider for AnthropicProvider {
             .header("x-api-key", self.api_key.clone())
             .send()
             .await?;
+
+        let status = response.status();
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+        
+        // Extract response headers before consuming the response
+        let response_headers: std::collections::HashMap<String, String> = response
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        
         let json: serde_json::Value = response.json().await?;
+
+        // Log HTTP response with correlation ID
+        log_http_response_with_correlation(
+            &correlation_id,
+            "anthropic",
+            status.as_u16(),
+            &response_headers,
+            &json,
+            duration_ms,
+        ).await;
+
         // if 'models' key missing, return None
         let arr = match json.get("models").and_then(|v| v.as_array()) {
             Some(arr) => arr,

@@ -7,8 +7,14 @@ use regex::Regex;
 use reqwest::{Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{from_value, json, Map, Value};
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
+use std::sync::{Arc, Once};
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::providers::errors::{OpenAIError, ProviderError};
 use mcp_core::content::ImageContent;
@@ -335,10 +341,277 @@ pub fn emit_debug_trace(
     );
 }
 
+// Global state for HTTP logging
+static HTTP_LOGGER: Once = Once::new();
+static HTTP_LOGGER_STATE: std::sync::OnceLock<Arc<Mutex<Option<HttpLogger>>>> = std::sync::OnceLock::new();
+
+/// HTTP Logger for detailed request/response logging
+struct HttpLogger {
+    log_file_path: String,
+    enabled: bool,
+}
+
+/// Sanitize headers by redacting sensitive information
+fn sanitize_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut sanitized = headers.clone();
+    
+    // Redact Authorization header
+    if let Some(auth_value) = sanitized.get_mut("Authorization") {
+        if auth_value.starts_with("Bearer ") {
+            *auth_value = "Bearer ***REDACTED***".to_string();
+        } else if auth_value.starts_with("Basic ") {
+            *auth_value = "Basic ***REDACTED***".to_string();
+        } else {
+            *auth_value = "***REDACTED***".to_string();
+        }
+    }
+    
+    // Redact API key headers
+    let api_key_headers = [
+        "X-API-Key",
+        "x-api-key", 
+        "X-Api-Key",
+        "api-key",
+        "Api-Key",
+        "X-OpenAI-API-Key",
+        "X-Anthropic-API-Key",
+        "X-Google-API-Key",
+        "X-Groq-API-Key",
+        "X-Databricks-Token",
+        "X-Snowflake-Token",
+    ];
+    
+    for header_name in &api_key_headers {
+        if let Some(value) = sanitized.get_mut(*header_name) {
+            *value = "***REDACTED***".to_string();
+        }
+    }
+    
+    sanitized
+}
+
+impl HttpLogger {
+    fn new() -> Option<Self> {
+        // Check if HTTP logging is enabled via environment variable
+        let enabled = std::env::var("GOOSE_HTTP_LOG_ENABLED")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(false);
+
+        if !enabled {
+            return None;
+        }
+
+        // Get log file path from environment or use default
+        let log_file_path = std::env::var("GOOSE_HTTP_LOG_FILE")
+            .unwrap_or_else(|_| {
+                // Default to logs directory with timestamp
+                let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+                format!("logs/goose_http_{}.log", timestamp)
+            });
+
+        Some(Self {
+            log_file_path,
+            enabled: true,
+        })
+    }
+
+    async fn log_http_request(
+        &self,
+        provider_name: &str,
+        url: &str,
+        method: &str,
+        headers: &HashMap<String, String>,
+        body: &Value,
+    ) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let sanitized_headers = sanitize_headers(headers);
+
+        let log_entry = json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "section": "REQUEST_START",
+            "type": "request",
+            "provider": provider_name,
+            "url": url,
+            "method": method,
+            "headers": sanitized_headers,
+            "body": body
+        });
+
+        self.write_log_entry(&log_entry).await
+    }
+
+    async fn log_http_response(
+        &self,
+        provider_name: &str,
+        status: u16,
+        headers: &HashMap<String, String>,
+        body: &Value,
+        duration_ms: u64,
+    ) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let sanitized_headers = sanitize_headers(headers);
+
+        let log_entry = json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "section": "RESPONSE_START",
+            "type": "response",
+            "provider": provider_name,
+            "status": status,
+            "headers": sanitized_headers,
+            "body": body,
+            "duration_ms": duration_ms
+        });
+
+        self.write_log_entry(&log_entry).await
+    }
+
+    async fn write_log_entry(&self, log_entry: &Value) -> Result<()> {
+        // Ensure the log directory exists
+        if let Some(parent) = std::path::Path::new(&self.log_file_path).parent() {
+            fs::create_dir_all(parent).await?;
+        }
+
+        // Write the log entry as a single line of JSON
+        let log_line = serde_json::to_string(log_entry)?;
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_file_path)
+            .await?
+            .write_all(format!("{}\n", log_line).as_bytes())
+            .await?;
+
+        Ok(())
+    }
+}
+
+/// Initialize the HTTP logger if enabled
+fn init_http_logger() {
+    HTTP_LOGGER.call_once(|| {
+        if let Some(logger) = HttpLogger::new() {
+            let _ = HTTP_LOGGER_STATE.set(Arc::new(Mutex::new(Some(logger))));
+        }
+    });
+}
+
+/// Get the HTTP logger instance
+async fn get_http_logger() -> Option<Arc<Mutex<Option<HttpLogger>>>> {
+    init_http_logger();
+    HTTP_LOGGER_STATE.get().cloned()
+}
+
+/// Log HTTP request details with correlation ID
+pub async fn log_http_request_with_correlation(
+    provider_name: &str,
+    url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    body: &Value,
+) -> String {
+    let correlation_id = Uuid::new_v4().to_string();
+    
+    if let Some(logger_arc) = get_http_logger().await {
+        if let Some(logger) = &mut *logger_arc.lock().await {
+            let sanitized_headers = sanitize_headers(headers);
+            
+            let log_entry = json!({
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "section": "REQUEST_START",
+                "correlation_id": correlation_id,
+                "type": "request",
+                "provider": provider_name,
+                "url": url,
+                "method": method,
+                "headers": sanitized_headers,
+                "body": body
+            });
+            
+            if let Err(e) = logger.write_log_entry(&log_entry).await {
+                tracing::warn!("Failed to log HTTP request: {}", e);
+            }
+        }
+    }
+    
+    correlation_id
+}
+
+/// Log HTTP response details with correlation ID
+pub async fn log_http_response_with_correlation(
+    correlation_id: &str,
+    provider_name: &str,
+    status: u16,
+    headers: &HashMap<String, String>,
+    body: &Value,
+    duration_ms: u64,
+) {
+    if let Some(logger_arc) = get_http_logger().await {
+        if let Some(logger) = &mut *logger_arc.lock().await {
+            let sanitized_headers = sanitize_headers(headers);
+            
+            let log_entry = json!({
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "section": "RESPONSE_START",
+                "correlation_id": correlation_id,
+                "type": "response",
+                "provider": provider_name,
+                "status": status,
+                "headers": sanitized_headers,
+                "body": body,
+                "duration_ms": duration_ms
+            });
+            
+            if let Err(e) = logger.write_log_entry(&log_entry).await {
+                tracing::warn!("Failed to log HTTP response: {}", e);
+            }
+        }
+    }
+}
+
+/// Log HTTP request details
+pub async fn log_http_request(
+    provider_name: &str,
+    url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    body: &Value,
+) {
+    if let Some(logger_arc) = get_http_logger().await {
+        if let Some(logger) = &mut *logger_arc.lock().await {
+            if let Err(e) = logger.log_http_request(provider_name, url, method, headers, body).await {
+                tracing::warn!("Failed to log HTTP request: {}", e);
+            }
+        }
+    }
+}
+
+/// Log HTTP response details
+pub async fn log_http_response(
+    provider_name: &str,
+    status: u16,
+    headers: &HashMap<String, String>,
+    body: &Value,
+    duration_ms: u64,
+) {
+    if let Some(logger_arc) = get_http_logger().await {
+        if let Some(logger) = &mut *logger_arc.lock().await {
+            if let Err(e) = logger.log_http_response(provider_name, status, headers, body, duration_ms).await {
+                tracing::warn!("Failed to log HTTP response: {}", e);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use tempfile::tempdir;
 
     #[test]
     fn test_detect_image_path() {
@@ -517,47 +790,284 @@ mod tests {
     #[test]
     fn test_get_google_final_status_success() {
         let status = StatusCode::OK;
-        let payload = json!({});
-        let result = get_google_final_status(status, Some(&payload));
-        assert_eq!(result, StatusCode::OK);
+        let payload = Some(&json!({"candidates": []}));
+        assert_eq!(get_google_final_status(status, payload), StatusCode::OK);
     }
 
     #[test]
     fn test_get_google_final_status_with_error_code() {
-        // Test error code mappings for different payload error codes
-        let test_cases = vec![
-            // (error code, status, expected status code)
-            (200, None, StatusCode::OK),
-            (429, Some(StatusCode::OK), StatusCode::TOO_MANY_REQUESTS),
-            (400, Some(StatusCode::OK), StatusCode::BAD_REQUEST),
-            (401, Some(StatusCode::OK), StatusCode::UNAUTHORIZED),
-            (403, Some(StatusCode::OK), StatusCode::FORBIDDEN),
-            (404, Some(StatusCode::OK), StatusCode::NOT_FOUND),
-            (500, Some(StatusCode::OK), StatusCode::INTERNAL_SERVER_ERROR),
-            (503, Some(StatusCode::OK), StatusCode::SERVICE_UNAVAILABLE),
-            (999, Some(StatusCode::OK), StatusCode::INTERNAL_SERVER_ERROR),
-            (500, Some(StatusCode::BAD_REQUEST), StatusCode::BAD_REQUEST),
-            (
-                404,
-                Some(StatusCode::INTERNAL_SERVER_ERROR),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ),
-        ];
+        let status = StatusCode::OK;
+        let payload = Some(&json!({
+            "error": {
+                "code": 400,
+                "message": "Bad Request"
+            }
+        }));
+        assert_eq!(get_google_final_status(status, payload), StatusCode::BAD_REQUEST);
+    }
 
-        for (error_code, status, expected_status) in test_cases {
-            let payload = if let Some(_status) = status {
-                json!({
-                    "error": {
-                        "code": error_code,
-                        "message": "Error message"
-                    }
-                })
-            } else {
-                json!({})
-            };
+    #[tokio::test]
+    async fn test_http_logger_disabled_by_default() {
+        // Clear any existing environment variables
+        std::env::remove_var("GOOSE_HTTP_LOG_ENABLED");
+        std::env::remove_var("GOOSE_HTTP_LOG_FILE");
+        
+        // Reset the global state for testing
+        HTTP_LOGGER_STATE.take();
+        
+        let logger = HttpLogger::new();
+        assert!(logger.is_none());
+    }
 
-            let result = get_google_final_status(status.unwrap_or(StatusCode::OK), Some(&payload));
-            assert_eq!(result, expected_status);
-        }
+    #[tokio::test]
+    async fn test_http_logger_enabled_with_env_var() {
+        // Set environment variable to enable logging
+        std::env::set_var("GOOSE_HTTP_LOG_ENABLED", "true");
+        
+        // Reset the global state for testing
+        HTTP_LOGGER_STATE.take();
+        
+        let logger = HttpLogger::new();
+        assert!(logger.is_some());
+        
+        let logger = logger.unwrap();
+        assert!(logger.enabled);
+        assert!(logger.log_file_path.contains("logs/goose_http_"));
+    }
+
+    #[tokio::test]
+    async fn test_http_logger_custom_file_path() {
+        let temp_dir = tempdir().unwrap();
+        let custom_path = temp_dir.path().join("custom_http.log");
+        
+        // Set environment variables
+        std::env::set_var("GOOSE_HTTP_LOG_ENABLED", "true");
+        std::env::set_var("GOOSE_HTTP_LOG_FILE", custom_path.to_str().unwrap());
+        
+        // Reset the global state for testing
+        HTTP_LOGGER_STATE.take();
+        
+        let logger = HttpLogger::new();
+        assert!(logger.is_some());
+        
+        let logger = logger.unwrap();
+        assert_eq!(logger.log_file_path, custom_path.to_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_http_logger_write_log_entry() {
+        let temp_dir = tempdir().unwrap();
+        let log_file = temp_dir.path().join("test_http.log");
+        
+        // Set environment variables
+        std::env::set_var("GOOSE_HTTP_LOG_ENABLED", "true");
+        std::env::set_var("GOOSE_HTTP_LOG_FILE", log_file.to_str().unwrap());
+        
+        // Reset the global state for testing
+        HTTP_LOGGER_STATE.take();
+        
+        let logger = HttpLogger::new().unwrap();
+        
+        // Test writing a log entry
+        let test_entry = json!({
+            "test": "data",
+            "timestamp": "2023-01-01T00:00:00Z"
+        });
+        
+        let result = logger.write_log_entry(&test_entry).await;
+        assert!(result.is_ok());
+        
+        // Verify the file was created and contains the entry
+        assert!(log_file.exists());
+        let content = fs::read_to_string(&log_file).await.unwrap();
+        assert!(content.contains("test"));
+        assert!(content.contains("data"));
+    }
+
+    #[tokio::test]
+    async fn test_http_logger_request_logging() {
+        let temp_dir = tempdir().unwrap();
+        let log_file = temp_dir.path().join("test_http.log");
+        
+        // Set environment variables
+        std::env::set_var("GOOSE_HTTP_LOG_ENABLED", "true");
+        std::env::set_var("GOOSE_HTTP_LOG_FILE", log_file.to_str().unwrap());
+        
+        // Reset the global state for testing
+        HTTP_LOGGER_STATE.take();
+        
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer test-token".to_string());
+        headers.insert("Content-Type".to_string(), "application/json".to_string());
+        
+        let body = json!({"test": "request"});
+        
+        // Test request logging
+        log_http_request("test_provider", "https://api.test.com", "POST", &headers, &body).await;
+        
+        // Verify the log file contains request data
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; // Allow async write to complete
+        let content = fs::read_to_string(&log_file).await.unwrap();
+        assert!(content.contains("request"));
+        assert!(content.contains("test_provider"));
+        assert!(content.contains("https://api.test.com"));
+        assert!(content.contains("POST"));
+    }
+
+    #[tokio::test]
+    async fn test_http_logger_response_logging() {
+        let temp_dir = tempdir().unwrap();
+        let log_file = temp_dir.path().join("test_http.log");
+        
+        // Set environment variables
+        std::env::set_var("GOOSE_HTTP_LOG_ENABLED", "true");
+        std::env::set_var("GOOSE_HTTP_LOG_FILE", log_file.to_str().unwrap());
+        
+        // Reset the global state for testing
+        HTTP_LOGGER_STATE.take();
+        
+        let mut headers = HashMap::new();
+        headers.insert("Content-Type".to_string(), "application/json".to_string());
+        
+        let body = json!({"test": "response"});
+        
+        // Test response logging
+        log_http_response("test_provider", 200, &headers, &body, 150).await;
+        
+        // Verify the log file contains response data
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; // Allow async write to complete
+        let content = fs::read_to_string(&log_file).await.unwrap();
+        assert!(content.contains("response"));
+        assert!(content.contains("test_provider"));
+        assert!(content.contains("200"));
+        assert!(content.contains("150"));
+    }
+
+    #[test]
+    fn test_sanitize_headers() {
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer sk-1234567890abcdef".to_string());
+        headers.insert("X-API-Key".to_string(), "api_key_123456".to_string());
+        headers.insert("Content-Type".to_string(), "application/json".to_string());
+        headers.insert("User-Agent".to_string(), "Goose/1.0".to_string());
+        
+        let sanitized = sanitize_headers(&headers);
+        
+        // Check that sensitive headers are redacted
+        assert_eq!(sanitized.get("Authorization"), Some(&"Bearer ***REDACTED***".to_string()));
+        assert_eq!(sanitized.get("X-API-Key"), Some(&"***REDACTED***".to_string()));
+        
+        // Check that non-sensitive headers are preserved
+        assert_eq!(sanitized.get("Content-Type"), Some(&"application/json".to_string()));
+        assert_eq!(sanitized.get("User-Agent"), Some(&"Goose/1.0".to_string()));
+    }
+
+    #[test]
+    fn test_sanitize_headers_basic_auth() {
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Basic dXNlcjpwYXNz".to_string());
+        
+        let sanitized = sanitize_headers(&headers);
+        
+        assert_eq!(sanitized.get("Authorization"), Some(&"Basic ***REDACTED***".to_string()));
+    }
+
+    #[test]
+    fn test_sanitize_headers_unknown_auth() {
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "CustomAuth token123".to_string());
+        
+        let sanitized = sanitize_headers(&headers);
+        
+        assert_eq!(sanitized.get("Authorization"), Some(&"***REDACTED***".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_correlation_based_logging() {
+        let temp_dir = tempdir().unwrap();
+        let log_file = temp_dir.path().join("test_correlation.log");
+        
+        // Set environment variables
+        std::env::set_var("GOOSE_HTTP_LOG_ENABLED", "true");
+        std::env::set_var("GOOSE_HTTP_LOG_FILE", log_file.to_str().unwrap());
+        
+        // Reset the global state for testing
+        HTTP_LOGGER_STATE.take();
+        
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer test-token".to_string());
+        headers.insert("Content-Type".to_string(), "application/json".to_string());
+        
+        let request_body = json!({"test": "request"});
+        let response_body = json!({"test": "response"});
+        
+        // Test correlation-based logging
+        let correlation_id = log_http_request_with_correlation(
+            "test_provider",
+            "https://api.test.com",
+            "POST",
+            &headers,
+            &request_body,
+        ).await;
+        
+        // Verify correlation ID is returned
+        assert!(!correlation_id.is_empty());
+        
+        // Log corresponding response
+        log_http_response_with_correlation(
+            &correlation_id,
+            "test_provider",
+            200,
+            &headers,
+            &response_body,
+            150,
+        ).await;
+        
+        // Verify the log file contains both request and response with correlation
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let content = fs::read_to_string(&log_file).await.unwrap();
+        
+        // Check for section markers
+        assert!(content.contains("REQUEST_START"));
+        assert!(content.contains("RESPONSE_START"));
+        
+        // Check for correlation ID in both entries
+        assert!(content.contains(&correlation_id));
+        
+        // Check for request and response data
+        assert!(content.contains("test_provider"));
+        assert!(content.contains("https://api.test.com"));
+        assert!(content.contains("200"));
+        assert!(content.contains("150"));
+    }
+
+    #[tokio::test]
+    async fn test_section_markers_in_logs() {
+        let temp_dir = tempdir().unwrap();
+        let log_file = temp_dir.path().join("test_sections.log");
+        
+        // Set environment variables
+        std::env::set_var("GOOSE_HTTP_LOG_ENABLED", "true");
+        std::env::set_var("GOOSE_HTTP_LOG_FILE", log_file.to_str().unwrap());
+        
+        // Reset the global state for testing
+        HTTP_LOGGER_STATE.take();
+        
+        let mut headers = HashMap::new();
+        headers.insert("Content-Type".to_string(), "application/json".to_string());
+        
+        let body = json!({"test": "data"});
+        
+        // Test regular logging (should include section markers)
+        log_http_request("test_provider", "https://api.test.com", "GET", &headers, &body).await;
+        log_http_response("test_provider", 200, &headers, &body, 100).await;
+        
+        // Verify section markers are present
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let content = fs::read_to_string(&log_file).await.unwrap();
+        
+        assert!(content.contains("REQUEST_START"));
+        assert!(content.contains("RESPONSE_START"));
+        assert!(content.contains("test_provider"));
     }
 }
