@@ -15,6 +15,7 @@ use super::embedding::EmbeddingCapable;
 use super::errors::ProviderError;
 use super::formats::databricks::{create_request, response_to_message};
 use super::oauth;
+use super::provider_logging;
 use super::retry::ProviderRetry;
 use super::utils::{
     get_model, handle_response_openai_compat, map_http_error_to_provider_error, ImageFormat,
@@ -292,9 +293,16 @@ impl Provider for DatabricksProvider {
 
         let mut log = RequestLog::start(&self.model, &payload)?;
 
+        // Log the request
+        provider_logging::log_request(&model_config.model_name, &payload);
+
         let response = self
             .with_retry(|| self.post(payload.clone(), Some(&model_config.model_name)))
-            .await?;
+            .await
+            .inspect_err(|e| {
+                let _ = log.error(e);
+                provider_logging::log_error(&model_config.model_name, e);
+            })?;
 
         let message = response_to_message(&response)?;
         let usage = response.get("usage").map(get_usage).unwrap_or_else(|| {
@@ -302,6 +310,10 @@ impl Provider for DatabricksProvider {
             Usage::default()
         });
         let response_model = get_model(&response);
+
+        // Log the response
+        provider_logging::log_response(&response_model, &message, Some(&usage));
+
         log.write(&response, Some(&usage))?;
 
         Ok((message, ProviderUsage::new(response_model, usage)))
@@ -329,6 +341,10 @@ impl Provider for DatabricksProvider {
 
         let path = self.get_endpoint_path(&model_config.model_name, false);
         let mut log = RequestLog::start(&self.model, &payload)?;
+
+        // Log the request
+        provider_logging::log_request(&model_config.model_name, &payload);
+
         let response = self
             .with_retry(|| async {
                 let resp = self.api_client.response_post(&path, &payload).await?;
@@ -345,21 +361,61 @@ impl Provider for DatabricksProvider {
             .await
             .inspect_err(|e| {
                 let _ = log.error(e);
+                provider_logging::log_error(&model_config.model_name, e);
             })?;
 
         let stream = response.bytes_stream().map_err(io::Error::other);
+        let model_name = model_config.model_name.clone();
+
+        // Log stream start
+        provider_logging::log_stream_start(&model_name);
 
         Ok(Box::pin(try_stream! {
             let stream_reader = StreamReader::new(stream);
             let framed = FramedRead::new(stream_reader, LinesCodec::new()).map_err(anyhow::Error::from);
 
-            let message_stream = response_to_streaming_message(framed);
+            // Wrap the framed stream to log raw JSON chunks
+            let logging_model_name = model_name.clone();
+            let logged_framed = framed.map(move |result| {
+                if let Ok(ref line) = result {
+                    // Log the raw line as JSON if it's a data line
+                    if let Some(json_str) = line.strip_prefix("data: ") {
+                        if json_str != "[DONE]" && !json_str.trim().is_empty() {
+                            if let Ok(json_value) = serde_json::from_str::<Value>(json_str.trim()) {
+                                provider_logging::log_stream_chunk(&logging_model_name, Some(&json_value), None);
+                            }
+                        }
+                    }
+                }
+                result
+            });
+
+            let message_stream = response_to_streaming_message(logged_framed);
             pin!(message_stream);
+            let mut last_message: Option<Message> = None;
+            let mut last_usage: Option<ProviderUsage> = None;
+
             while let Some(message) = message_stream.next().await {
                 let (message, usage) = message.map_err(|e| ProviderError::RequestFailed(format!("Stream decode error: {}", e)))?;
+
+                // Log usage when it arrives
+                if let Some(ref u) = usage {
+                    provider_logging::log_stream_chunk(&model_name, None, Some(u));
+                }
+
+                if message.is_some() {
+                    last_message = message.clone();
+                }
+                if usage.is_some() {
+                    last_usage = usage.clone();
+                }
+
                 log.write(&message, usage.as_ref().map(|f| f.usage).as_ref())?;
                 yield (message, usage);
             }
+
+            // Log stream end
+            provider_logging::log_stream_end(&model_name, last_message.as_ref(), last_usage.as_ref());
         }))
     }
 

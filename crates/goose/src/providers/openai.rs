@@ -22,6 +22,7 @@ use super::formats::openai_responses::{
     create_responses_request, get_responses_usage, responses_api_to_message,
     responses_api_to_streaming_message, ResponsesApiResponse,
 };
+use super::provider_logging;
 use super::retry::ProviderRetry;
 use super::utils::{
     get_model, handle_response_openai_compat, handle_status_openai_compat, ImageFormat,
@@ -261,6 +262,9 @@ impl Provider for OpenAiProvider {
             let payload = create_responses_request(model_config, system, messages, tools)?;
             let mut log = RequestLog::start(&self.model, &payload)?;
 
+            // Log the request
+            provider_logging::log_request(&model_config.model_name, &payload);
+
             let json_response = self
                 .with_retry(|| async {
                     let payload_clone = payload.clone();
@@ -269,6 +273,7 @@ impl Provider for OpenAiProvider {
                 .await
                 .inspect_err(|e| {
                     let _ = log.error(e);
+                    provider_logging::log_error(&model_config.model_name, e);
                 })?;
 
             let responses_api_response: ResponsesApiResponse =
@@ -283,6 +288,9 @@ impl Provider for OpenAiProvider {
             let usage = get_responses_usage(&responses_api_response);
             let model = responses_api_response.model.clone();
 
+            // Log the response
+            provider_logging::log_response(&model, &message, Some(&usage));
+
             log.write(&json_response, Some(&usage))?;
             Ok((message, ProviderUsage::new(model, usage)))
         } else {
@@ -290,6 +298,10 @@ impl Provider for OpenAiProvider {
                 create_request(model_config, system, messages, tools, &ImageFormat::OpenAi)?;
 
             let mut log = RequestLog::start(&self.model, &payload)?;
+
+            // Log the request
+            provider_logging::log_request(&model_config.model_name, &payload);
+
             let json_response = self
                 .with_retry(|| async {
                     let payload_clone = payload.clone();
@@ -298,6 +310,7 @@ impl Provider for OpenAiProvider {
                 .await
                 .inspect_err(|e| {
                     let _ = log.error(e);
+                    provider_logging::log_error(&model_config.model_name, e);
                 })?;
 
             let message = response_to_message(&json_response)?;
@@ -310,6 +323,10 @@ impl Provider for OpenAiProvider {
                 });
 
             let model = get_model(&json_response);
+
+            // Log the response
+            provider_logging::log_response(&model, &message, Some(&usage));
+
             log.write(&json_response, Some(&usage))?;
             Ok((message, ProviderUsage::new(model, usage)))
         }
@@ -375,6 +392,9 @@ impl Provider for OpenAiProvider {
 
             let mut log = RequestLog::start(&self.model, &payload)?;
 
+            // Log the request
+            provider_logging::log_request(&self.model.model_name, &payload);
+
             let response = self
                 .with_retry(|| async {
                     let payload_clone = payload.clone();
@@ -387,21 +407,61 @@ impl Provider for OpenAiProvider {
                 .await
                 .inspect_err(|e| {
                     let _ = log.error(e);
+                    provider_logging::log_error(&self.model.model_name, e);
                 })?;
 
             let stream = response.bytes_stream().map_err(io::Error::other);
+            let model_name = self.model.model_name.clone();
+
+            // Log stream start
+            provider_logging::log_stream_start(&model_name);
 
             Ok(Box::pin(try_stream! {
                 let stream_reader = StreamReader::new(stream);
                 let framed = FramedRead::new(stream_reader, LinesCodec::new()).map_err(anyhow::Error::from);
 
-                let message_stream = responses_api_to_streaming_message(framed);
+                // Wrap the framed stream to log raw JSON chunks
+                let logging_model_name = model_name.clone();
+                let logged_framed = framed.map(move |result| {
+                    if let Ok(ref line) = result {
+                        // Log the raw line as JSON if it's a data line
+                        if let Some(json_str) = line.strip_prefix("data: ") {
+                            if json_str != "[DONE]" && !json_str.trim().is_empty() {
+                                if let Ok(json_value) = serde_json::from_str::<Value>(json_str.trim()) {
+                                    provider_logging::log_stream_chunk(&logging_model_name, Some(&json_value), None);
+                                }
+                            }
+                        }
+                    }
+                    result
+                });
+
+                let message_stream = responses_api_to_streaming_message(logged_framed);
                 pin!(message_stream);
+                let mut last_message: Option<Message> = None;
+                let mut last_usage: Option<ProviderUsage> = None;
+
                 while let Some(message) = message_stream.next().await {
                     let (message, usage) = message.map_err(|e| ProviderError::RequestFailed(format!("Stream decode error: {}", e)))?;
+
+                    // Log usage when it arrives
+                    if let Some(ref u) = usage {
+                        provider_logging::log_stream_chunk(&model_name, None, Some(u));
+                    }
+
+                    if message.is_some() {
+                        last_message = message.clone();
+                    }
+                    if usage.is_some() {
+                        last_usage = usage.clone();
+                    }
+
                     log.write(&message, usage.as_ref().map(|f| f.usage).as_ref())?;
                     yield (message, usage);
                 }
+
+                // Log stream end
+                provider_logging::log_stream_end(&model_name, last_message.as_ref(), last_usage.as_ref());
             }))
         } else {
             let mut payload =
@@ -411,6 +471,9 @@ impl Provider for OpenAiProvider {
                 "include_usage": true,
             });
             let mut log = RequestLog::start(&self.model, &payload)?;
+
+            // Log the request
+            provider_logging::log_request(&self.model.model_name, &payload);
 
             let response = self
                 .with_retry(|| async {
@@ -423,21 +486,61 @@ impl Provider for OpenAiProvider {
                 .await
                 .inspect_err(|e| {
                     let _ = log.error(e);
+                    provider_logging::log_error(&self.model.model_name, e);
                 })?;
 
             let stream = response.bytes_stream().map_err(io::Error::other);
+            let model_name = self.model.model_name.clone();
+
+            // Log stream start
+            provider_logging::log_stream_start(&model_name);
 
             Ok(Box::pin(try_stream! {
                 let stream_reader = StreamReader::new(stream);
                 let framed = FramedRead::new(stream_reader, LinesCodec::new()).map_err(anyhow::Error::from);
 
-                let message_stream = response_to_streaming_message(framed);
+                // Wrap the framed stream to log raw JSON chunks
+                let logging_model_name = model_name.clone();
+                let logged_framed = framed.map(move |result| {
+                    if let Ok(ref line) = result {
+                        // Log the raw line as JSON if it's a data line
+                        if let Some(json_str) = line.strip_prefix("data: ") {
+                            if json_str != "[DONE]" && !json_str.trim().is_empty() {
+                                if let Ok(json_value) = serde_json::from_str::<Value>(json_str.trim()) {
+                                    provider_logging::log_stream_chunk(&logging_model_name, Some(&json_value), None);
+                                }
+                            }
+                        }
+                    }
+                    result
+                });
+
+                let message_stream = response_to_streaming_message(logged_framed);
                 pin!(message_stream);
+                let mut last_message: Option<Message> = None;
+                let mut last_usage: Option<ProviderUsage> = None;
+
                 while let Some(message) = message_stream.next().await {
                     let (message, usage) = message.map_err(|e| ProviderError::RequestFailed(format!("Stream decode error: {}", e)))?;
+
+                    // Log usage when it arrives
+                    if let Some(ref u) = usage {
+                        provider_logging::log_stream_chunk(&model_name, None, Some(u));
+                    }
+
+                    if message.is_some() {
+                        last_message = message.clone();
+                    }
+                    if usage.is_some() {
+                        last_usage = usage.clone();
+                    }
+
                     log.write(&message, usage.as_ref().map(|f| f.usage).as_ref())?;
                     yield (message, usage);
                 }
+
+                // Log stream end
+                provider_logging::log_stream_end(&model_name, last_message.as_ref(), last_usage.as_ref());
             }))
         }
     }
