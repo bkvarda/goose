@@ -3,7 +3,7 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use reqwest::StatusCode;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::io;
 use tokio::pin;
@@ -295,7 +295,7 @@ impl Provider for OpenAiProvider {
             Ok((message, ProviderUsage::new(model, usage)))
         } else {
             let payload =
-                create_request(model_config, system, messages, tools, &ImageFormat::OpenAi)?;
+                create_request(model_config, system, messages, tools, &ImageFormat::OpenAi, false)?;
 
             let mut log = RequestLog::start(&self.model, &payload)?;
 
@@ -464,12 +464,8 @@ impl Provider for OpenAiProvider {
                 provider_logging::log_stream_end(&model_name, last_message.as_ref(), last_usage.as_ref());
             }))
         } else {
-            let mut payload =
-                create_request(&self.model, system, messages, tools, &ImageFormat::OpenAi)?;
-            payload["stream"] = serde_json::Value::Bool(true);
-            payload["stream_options"] = json!({
-                "include_usage": true,
-            });
+            let payload =
+                create_request(&self.model, system, messages, tools, &ImageFormat::OpenAi, true)?;
             let mut log = RequestLog::start(&self.model, &payload)?;
 
             // Log the request
